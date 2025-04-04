@@ -82,6 +82,51 @@ bool validate_flash_attention_args(
   return true;
 }
 
+bool validate_cache_quant_params_args(
+    const Tensor& t,
+    const Tensor& t_zero_points,
+    const Tensor& t_scales) {
+  ET_CHECK_OR_RETURN_FALSE(
+      t.dim() == t_scales.dim(),
+      "Quantized tensor and scales must have the same number of dimensions");
+  ET_CHECK_OR_RETURN_FALSE(
+      t.dim() == t_zero_points.dim(),
+      "Quantized tensor and scales must have the same number of dimensions");
+
+  ET_CHECK_OR_RETURN_FALSE(
+      (t.scalar_type() == ScalarType::Char), "Tensor must be of int8_t type");
+
+  ET_CHECK_OR_RETURN_FALSE(
+      (t_scales.scalar_type() == ScalarType::Float),
+      "Scales tensor must be of float type");
+
+  ET_CHECK_OR_RETURN_FALSE(
+      (t_zero_points.scalar_type() == ScalarType::Char),
+      "Zero points tensor must be of int8_t type");
+
+  // Sizes
+  for (int64_t i = 0; i < t.dim() - 1; i++) {
+    ET_CHECK_OR_RETURN_FALSE(
+        (t.size(i) == t_scales.size(i)),
+        "Quantized tensor and scales have different shape"
+        "at dim: %" PRId64 ", t: %zd, t_scales: %zd",
+        i,
+        t.size(i),
+        t_scales.size(i));
+    ;
+    ET_CHECK_OR_RETURN_FALSE(
+        (t.size(i) == t_zero_points.size(i)),
+        "Quantized tensor and zero points have different shape"
+        "at dim: %" PRId64 ", t: %zd, t_scales: %zd",
+        i,
+        t.size(i),
+        t_zero_points.size(i));
+    ;
+  }
+
+  return true;
+}
+
 bool validate_cache_params(
     const Tensor& k_cache,
     const Tensor& v_cache,
@@ -233,7 +278,13 @@ Tensor& flash_attention_kernel_out(
               dropout_p,
               is_causal,
               attn_mask,
-              scale);
+              scale,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt);
         } else if (q_seq_len >= 192) {
           sdpa::impl::cpu_flash_attention<CTYPE, 64, 512>(
               output,
@@ -243,7 +294,13 @@ Tensor& flash_attention_kernel_out(
               dropout_p,
               is_causal,
               attn_mask,
-              scale);
+              scale,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt);
         } else {
           sdpa::impl::cpu_flash_attention<CTYPE, 32, 512>(
               output,
@@ -253,7 +310,161 @@ Tensor& flash_attention_kernel_out(
               dropout_p,
               is_causal,
               attn_mask,
-              scale);
+              scale,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt,
+              nullopt);
+        }
+      });
+  return output;
+}
+
+Tensor& custom_sdpa_out_impl(
+    RuntimeContext& ctx,
+    const Tensor& q,
+    const Tensor& k,
+    const Tensor& v,
+    const int64_t start_pos,
+    const optional<Tensor>& attn_mask,
+    const double dropout_p,
+    const bool is_causal,
+    // @lint-ignore CLANGTIDY facebook-hte-ParameterMightThrowOnCopy
+    const optional<double> scale,
+    Tensor& output,
+    const optional<Tensor>& q_zero_points = nullopt,
+    const optional<Tensor>& q_scales = nullopt,
+    const optional<Tensor>& k_zero_points = nullopt,
+    const optional<Tensor>& k_scales = nullopt,
+    const optional<Tensor>& v_zero_points = nullopt,
+    const optional<Tensor>& v_scales = nullopt) {
+  ET_KERNEL_CHECK_MSG(
+      ctx,
+      !attn_mask.has_value() || !is_causal,
+      InvalidArgument,
+      output,
+      "attn_mask and is_causal cannot be set at the same time");
+
+  ET_KERNEL_CHECK_MSG(
+      ctx,
+      validate_flash_attention_args(q, k, v, attn_mask),
+      InvalidArgument,
+      output,
+      "Invalid arguments");
+
+  bool is_seq_at_dim_1{true};
+  if (q.scalar_type() == ScalarType::Char) {
+    is_seq_at_dim_1 = false;
+    ET_KERNEL_CHECK_MSG(
+        ctx,
+        q_scales.has_value() && q_zero_points.has_value() &&
+            k_scales.has_value() && k_zero_points.has_value() &&
+            q_scales.has_value() && q_zero_points.has_value(),
+        InvalidArgument,
+        output,
+        "If q is quantized, k and v must be quantized as well");
+    ET_KERNEL_CHECK_MSG(
+        ctx,
+        validate_cache_quant_params_args(
+            q, q_zero_points.value(), q_scales.value()),
+        InvalidArgument,
+        output,
+        "Invalid arguments for quantized query");
+    ET_KERNEL_CHECK_MSG(
+        ctx,
+        validate_cache_quant_params_args(
+            k, k_zero_points.value(), k_scales.value()),
+        InvalidArgument,
+        output,
+        "Invalid arguments for quantized key");
+    ET_KERNEL_CHECK_MSG(
+        ctx,
+        validate_cache_quant_params_args(
+            v, v_zero_points.value(), v_scales.value()),
+        InvalidArgument,
+        output,
+        "Invalid arguments for quantized value");
+  }
+
+  ET_CHECK_MSG(q.dim() == 4, "query must be a 4D tensor");
+
+  const int64_t seq_len = q.size(1);
+  auto q_seq_len = q.size(1);
+
+  const int64_t num_keys_for_causal_attention = start_pos + seq_len;
+
+  ET_KERNEL_CHECK(
+      ctx,
+      resize_tensor(output, q.sizes()) == Error::Ok,
+      InvalidArgument,
+      output);
+
+  // TODO(task): replace the template param selection logic
+  // with whatever apprpriately makes more sense for
+  ET_SWITCH_FLOAT_TYPES(
+      output.scalar_type(), ctx, "flash_attention", CTYPE, [&] {
+        // TODO we need to re-evaluate this for ARM CPUs
+        // And there can be many so instead of templatizing
+        // we might consider another appraoch
+        if (q_seq_len >= 768) {
+          sdpa::impl::cpu_flash_attention<CTYPE, 256, 512>(
+              output,
+              q,
+              k,
+              v,
+              dropout_p,
+              is_causal,
+              attn_mask,
+              scale,
+              nullopt, // q_zero_points
+              nullopt, // q_scales
+              nullopt, // k_zero_points
+              nullopt, // k_scales
+              nullopt, // v_zero_points
+              nullopt, // v_scales
+              is_seq_at_dim_1, /* is_seq_at_dim_1 */
+              start_pos,
+              num_keys_for_causal_attention);
+        } else if (q_seq_len >= 192) {
+          sdpa::impl::cpu_flash_attention<CTYPE, 64, 512>(
+              output,
+              q,
+              k,
+              v,
+              dropout_p,
+              is_causal,
+              attn_mask,
+              scale,
+              nullopt, // q_zero_points
+              nullopt, // q_scales
+              nullopt, // k_zero_points
+              nullopt, // k_scales
+              nullopt, // v_zero_points
+              nullopt, // v_scales
+              is_seq_at_dim_1, /* is_seq_at_dim_1 */
+              start_pos,
+              num_keys_for_causal_attention);
+        } else {
+          sdpa::impl::cpu_flash_attention<CTYPE, 32, 512>(
+              output,
+              q,
+              k,
+              v,
+              dropout_p,
+              is_causal,
+              attn_mask,
+              scale,
+              nullopt, // q_zero_points
+              nullopt, // q_scales
+              nullopt, // k_zero_points
+              nullopt, // k_scales
+              nullopt, // v_zero_points
+              nullopt, // v_scales
+              is_seq_at_dim_1, /* is_seq_at_dim_1 */
+              start_pos,
+              num_keys_for_causal_attention);
         }
       });
   return output;
@@ -273,7 +484,6 @@ Tensor& flash_attention_kernel_out(
   Format [n_layers, batch size, max_seq_len, num heads, head dim]
   ....
   @param[in] start_pos: sequence position
-  @param[in] seq_len: Seq length. e.g. seq_len dim of q_projected.
 */
 Tensor& custom_sdpa_out(
     RuntimeContext& ctx,
@@ -287,127 +497,8 @@ Tensor& custom_sdpa_out(
     // @lint-ignore CLANGTIDY facebook-hte-ParameterMightThrowOnCopy
     const optional<double> scale,
     Tensor& output) {
-  ET_KERNEL_CHECK_MSG(
-      ctx,
-      !attn_mask.has_value() || !is_causal,
-      InvalidArgument,
-      output,
-      "attn_mask and is_causal cannot be set at the same time");
-
-  ET_CHECK_MSG(q.dim() == 4, "query must be a 4D tensor");
-
-  const int64_t seq_len = q.size(1);
-  auto q_seq_len = q.size(1);
-
-  // Refactor the following into create_view util perhaps using
-  // TensorPtr
-  std::array<::executorch::aten::DimOrderType, sdpa::impl::kKVDim>
-      sliced_key_dim_order{0, 1, 2, 3};
-  std::array<::executorch::aten::SizesType, sdpa::impl::kKVDim>
-      sliced_key_sizes;
-  sliced_key_sizes[0] = k.size(0);
-  sliced_key_sizes[1] = start_pos + seq_len; // key_cache.size(2);
-  sliced_key_sizes[2] = k.size(2);
-  sliced_key_sizes[3] = k.size(3);
-  std::array<::executorch::aten::StridesType, sdpa::impl::kKVDim>
-      sliced_key_strides;
-  dim_order_to_stride_nocheck(
-      sliced_key_sizes.data(),
-      sliced_key_dim_order.data(),
-      sdpa::impl::kKVDim,
-      sliced_key_strides.data());
-  // since the cache is sliced, the batch stride needs to stay the same.
-  sliced_key_strides[0] = k.strides()[0];
-  void* key_cache_data = k.mutable_data_ptr();
-  TensorImpl k_impl = TensorImpl(
-      k.scalar_type(),
-      sdpa::impl::kKVDim,
-      sliced_key_sizes.data(),
-      key_cache_data,
-      sliced_key_dim_order.data(),
-      sliced_key_strides.data(),
-      TensorShapeDynamism::STATIC);
-  Tensor sliced_key_cache(&k_impl);
-
-  std::array<::executorch::aten::DimOrderType, sdpa::impl::kKVDim>
-      sliced_value_dim_order{0, 1, 2, 3};
-  std::array<::executorch::aten::SizesType, sdpa::impl::kKVDim>
-      sliced_value_sizes;
-  sliced_value_sizes[0] = v.size(0);
-  sliced_value_sizes[1] = start_pos + seq_len; // value_cache.size(2);
-  sliced_value_sizes[2] = v.size(2);
-  sliced_value_sizes[3] = v.size(3);
-  std::array<::executorch::aten::StridesType, sdpa::impl::kKVDim>
-      sliced_value_strides;
-  dim_order_to_stride_nocheck(
-      sliced_value_sizes.data(),
-      sliced_value_dim_order.data(),
-      sdpa::impl::kKVDim,
-      sliced_value_strides.data());
-  // since the cache is sliced, the batch stride needs to stay the same.
-  sliced_value_strides[0] = v.strides()[0];
-  void* value_cache_data = v.mutable_data_ptr();
-  TensorImpl value_impl = TensorImpl(
-      v.scalar_type(),
-      sdpa::impl::kKVDim,
-      sliced_value_sizes.data(),
-      value_cache_data,
-      sliced_value_dim_order.data(),
-      sliced_value_strides.data(),
-      TensorShapeDynamism::STATIC);
-  Tensor sliced_value_cache(&value_impl);
-
-  ET_KERNEL_CHECK(
-      ctx,
-      resize_tensor(output, q.sizes()) == Error::Ok,
-      InvalidArgument,
-      output);
-
-  // TODO(task): replace the template param selection logic
-  // with whatever apprpriately makes more sense for
-  ET_SWITCH_FLOAT_TYPES(q.scalar_type(), ctx, "flash_attention", CTYPE, [&] {
-    // TODO we need to re-evaluate this for ARM CPUs
-    // And there can be many so instead of templatizing
-    // we might consider another appraoch
-    if (q_seq_len >= 768) {
-      sdpa::impl::cpu_flash_attention<CTYPE, 256, 512>(
-          output,
-          q,
-          sliced_key_cache,
-          sliced_value_cache,
-          dropout_p,
-          is_causal,
-          attn_mask,
-          scale,
-          true, /* is_seq_at_dim_1 */
-          start_pos);
-    } else if (q_seq_len >= 192) {
-      sdpa::impl::cpu_flash_attention<CTYPE, 64, 512>(
-          output,
-          q,
-          sliced_key_cache,
-          sliced_value_cache,
-          dropout_p,
-          is_causal,
-          attn_mask,
-          scale,
-          true, /* is_seq_at_dim_1 */
-          start_pos);
-    } else {
-      sdpa::impl::cpu_flash_attention<CTYPE, 32, 512>(
-          output,
-          q,
-          sliced_key_cache,
-          sliced_value_cache,
-          dropout_p,
-          is_causal,
-          attn_mask,
-          scale,
-          true, /* is_seq_at_dim_1 */
-          start_pos);
-    }
-  });
-  return output;
+  return custom_sdpa_out_impl(
+      ctx, q, k, v, start_pos, attn_mask, dropout_p, is_causal, scale, output);
 }
 /*
   Input params
